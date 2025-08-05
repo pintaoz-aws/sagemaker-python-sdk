@@ -25,7 +25,9 @@ from graphene.utils.str_converters import to_camel_case, to_snake_case
 
 from sagemaker_core.main import resources
 from sagemaker_core.resources import TrainingJob
+from sagemaker_core import shapes
 from sagemaker_core.shapes import AlgorithmSpecification
+from sagemaker_core.main.utils import serialize
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr, validate_call
 
@@ -48,11 +50,11 @@ from sagemaker.config.config_schema import (
 
 from sagemaker.utils import resolve_value_from_config
 from sagemaker.modules import Session, get_execution_role
+from sagemaker.modules import configs
 from sagemaker.modules.configs import (
     Compute,
     StoppingCondition,
     RetryStrategy,
-    OutputDataConfig,
     SourceCode,
     TrainingImageConfig,
     Channel,
@@ -64,9 +66,8 @@ from sagemaker.modules.configs import (
     InfraCheckConfig,
     RemoteDebugConfig,
     SessionChainingConfig,
-    TensorBoardOutputConfig,
-    CheckpointConfig,
     InputData,
+    MetricDefinition,
 )
 
 from sagemaker.modules.local_core.local_container import _LocalContainer
@@ -85,6 +86,9 @@ from sagemaker.modules.constants import (
     SM_CODE_CONTAINER_PATH,
     SM_DRIVERS,
     SM_DRIVERS_LOCAL_PATH,
+    SM_RECIPE,
+    SM_RECIPE_YAML,
+    SM_RECIPE_CONTAINER_PATH,
     TRAIN_SCRIPT,
     DEFAULT_CONTAINER_ENTRYPOINT,
     DEFAULT_CONTAINER_ARGUMENTS,
@@ -100,7 +104,12 @@ from sagemaker.modules.templates import (
 from sagemaker.telemetry.telemetry_logging import _telemetry_emitter
 from sagemaker.telemetry.constants import Feature
 from sagemaker.modules import logger
-from sagemaker.modules.train.sm_recipes.utils import _get_args_from_recipe, _determine_device_type
+from sagemaker.modules.train.sm_recipes.utils import (
+    _get_args_from_recipe,
+    _determine_device_type,
+    _is_nova_recipe,
+    _load_base_recipe,
+)
 
 
 class Mode(Enum):
@@ -120,7 +129,8 @@ class ModelTrainer(BaseModel):
         from sagemaker.modules.train import ModelTrainer
         from sagemaker.modules.configs import SourceCode, Compute, InputData
 
-        source_code = SourceCode(source_dir="source", entry_script="train.py")
+        ignore_patterns = ['.env', '.git', '__pycache__', '.DS_Store', 'data']
+        source_code = SourceCode(source_dir="source", entry_script="train.py", ignore_patterns=ignore_patterns)
         training_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/my-training-image"
         model_trainer = ModelTrainer(
             training_image=training_image,
@@ -221,9 +231,9 @@ class ModelTrainer(BaseModel):
     training_image: Optional[str] = None
     training_image_config: Optional[TrainingImageConfig] = None
     algorithm_name: Optional[str] = None
-    output_data_config: Optional[OutputDataConfig] = None
+    output_data_config: Optional[shapes.OutputDataConfig] = None
     input_data_config: Optional[List[Union[Channel, InputData]]] = None
-    checkpoint_config: Optional[CheckpointConfig] = None
+    checkpoint_config: Optional[shapes.CheckpointConfig] = None
     training_input_mode: Optional[str] = "File"
     environment: Optional[Dict[str, str]] = {}
     hyperparameters: Optional[Union[Dict[str, Any], str]] = {}
@@ -234,13 +244,16 @@ class ModelTrainer(BaseModel):
     _latest_training_job: Optional[resources.TrainingJob] = PrivateAttr(default=None)
 
     # Private TrainingJob Parameters
-    _tensorboard_output_config: Optional[TensorBoardOutputConfig] = PrivateAttr(default=None)
+    _tensorboard_output_config: Optional[shapes.TensorBoardOutputConfig] = PrivateAttr(default=None)
     _retry_strategy: Optional[RetryStrategy] = PrivateAttr(default=None)
     _infra_check_config: Optional[InfraCheckConfig] = PrivateAttr(default=None)
     _session_chaining_config: Optional[SessionChainingConfig] = PrivateAttr(default=None)
     _remote_debug_config: Optional[RemoteDebugConfig] = PrivateAttr(default=None)
+    _metric_definitions: Optional[List[MetricDefinition]] = PrivateAttr(default=None)
 
+    _is_nova_recipe: Optional[bool] = PrivateAttr(default=None)
     _temp_recipe_train_dir: Optional[TemporaryDirectory] = PrivateAttr(default=None)
+    _temp_code_dir: Optional[TemporaryDirectory] = PrivateAttr(default=None)
 
     CONFIGURABLE_ATTRIBUTES: ClassVar[List[str]] = [
         "role",
@@ -265,8 +278,8 @@ class ModelTrainer(BaseModel):
         "networking": Networking,
         "stopping_condition": StoppingCondition,
         "training_image_config": TrainingImageConfig,
-        "output_data_config": OutputDataConfig,
-        "checkpoint_config": CheckpointConfig,
+        "output_data_config": configs.OutputDataConfig,
+        "checkpoint_config": configs.CheckpointConfig,
     }
 
     def _populate_intelligent_defaults(self):
@@ -318,7 +331,7 @@ class ModelTrainer(BaseModel):
                 config_path=TRAINING_JOB_OUTPUT_DATA_CONFIG_PATH
             )
             if default_output_data_config:
-                self.output_data_config = OutputDataConfig(
+                self.output_data_config = configs.OutputDataConfig(
                     **self._convert_keys_to_snake(default_output_data_config)
                 )
 
@@ -369,6 +382,8 @@ class ModelTrainer(BaseModel):
         if hasattr(self, "__pydantic_fields_set__"):
             if self._temp_recipe_train_dir is not None:
                 self._temp_recipe_train_dir.cleanup()
+            if self._temp_code_dir is not None:
+                self._temp_code_dir.cleanup()
 
     def _validate_training_image_and_algorithm_name(
         self, training_image: Optional[str], algorithm_name: Optional[str]
@@ -447,6 +462,33 @@ class ModelTrainer(BaseModel):
                                 + "Must be a valid file within the 'source_dir'.",
                             )
 
+    @staticmethod
+    def _validate_and_load_hyperparameters_file(hyperparameters_file: str) -> Dict[str, Any]:
+        """Validate the hyperparameters file."""
+        if not os.path.exists(hyperparameters_file):
+            raise ValueError(f"Hyperparameters file not found: {hyperparameters_file}")
+        logger.info(f"Loading hyperparameters from file: {hyperparameters_file}")
+        with open(hyperparameters_file, "r") as f:
+            contents = f.read()
+            try:
+                hyperparameters = json.loads(contents)
+                logger.debug("Hyperparameters loaded as JSON")
+                return hyperparameters
+            except json.JSONDecodeError:
+                try:
+                    logger.info(f"contents: {contents}")
+                    hyperparameters = yaml.safe_load(contents)
+                    if not isinstance(hyperparameters, dict):
+                        raise ValueError("YAML contents must be a valid mapping")
+                    logger.info(f"hyperparameters: {hyperparameters}")
+                    logger.debug("Hyperparameters loaded as YAML")
+                    return hyperparameters
+                except (yaml.YAMLError, ValueError):
+                    raise ValueError(
+                        f"Invalid hyperparameters file: {hyperparameters_file}. "
+                        "Must be a valid JSON or YAML file."
+                    )
+
     def model_post_init(self, __context: Any):
         """Post init method to perform custom validation and set default values."""
         self._validate_training_image_and_algorithm_name(self.training_image, self.algorithm_name)
@@ -477,6 +519,20 @@ class ModelTrainer(BaseModel):
             )
             logger.warning(f"Compute not provided. Using default:\n{self.compute}")
 
+        if self.compute.instance_type is None:
+            self.compute.instance_type = DEFAULT_INSTANCE_TYPE
+            logger.warning(f"Instance type not provided. Using default:\n{DEFAULT_INSTANCE_TYPE}")
+        if self.compute.instance_count is None:
+            self.compute.instance_count = 1
+            logger.warning(
+                f"Instance count not provided. Using default:\n{self.compute.instance_count}"
+            )
+        if self.compute.volume_size_in_gb is None:
+            self.compute.volume_size_in_gb = 30
+            logger.warning(
+                f"Volume size not provided. Using default:\n{self.compute.volume_size_in_gb}"
+            )
+
         if self.stopping_condition is None:
             self.stopping_condition = StoppingCondition(
                 max_runtime_in_seconds=3600,
@@ -486,86 +542,126 @@ class ModelTrainer(BaseModel):
             logger.warning(
                 f"StoppingCondition not provided. Using default:\n{self.stopping_condition}"
             )
+        if self.stopping_condition.max_runtime_in_seconds is None:
+            self.stopping_condition.max_runtime_in_seconds = 3600
+            logger.info(
+                "Max runtime not provided. Using default:\n"
+                f"{self.stopping_condition.max_runtime_in_seconds}"
+            )
 
         if self.hyperparameters and isinstance(self.hyperparameters, str):
-            if not os.path.exists(self.hyperparameters):
-                raise ValueError(f"Hyperparameters file not found: {self.hyperparameters}")
-            logger.info(f"Loading hyperparameters from file: {self.hyperparameters}")
-            with open(self.hyperparameters, "r") as f:
-                contents = f.read()
-                try:
-                    self.hyperparameters = json.loads(contents)
-                    logger.debug("Hyperparameters loaded as JSON")
-                except json.JSONDecodeError:
-                    try:
-                        logger.info(f"contents: {contents}")
-                        self.hyperparameters = yaml.safe_load(contents)
-                        if not isinstance(self.hyperparameters, dict):
-                            raise ValueError("YAML contents must be a valid mapping")
-                        logger.info(f"hyperparameters: {self.hyperparameters}")
-                        logger.debug("Hyperparameters loaded as YAML")
-                    except (yaml.YAMLError, ValueError):
-                        raise ValueError(
-                            f"Invalid hyperparameters file: {self.hyperparameters}. "
-                            "Must be a valid JSON or YAML file."
-                        )
-
-        if self.training_mode == Mode.SAGEMAKER_TRAINING_JOB and self.output_data_config is None:
-            session = self.sagemaker_session
-            base_job_name = self.base_job_name
-            self.output_data_config = OutputDataConfig(
-                s3_output_path=f"s3://{self._fetch_bucket_name_and_prefix(session)}"
-                f"/{base_job_name}",
-                compression_type="GZIP",
-                kms_key_id=None,
-            )
-            logger.warning(
-                f"OutputDataConfig not provided. Using default:\n{self.output_data_config}"
+            self.hyperparameters = self._validate_and_load_hyperparameters_file(
+                self.hyperparameters
             )
 
-        # TODO: Autodetect which image to use if source_code is provided
+        if self.training_mode == Mode.SAGEMAKER_TRAINING_JOB:
+            if self.output_data_config is None:
+                session = self.sagemaker_session
+                base_job_name = self.base_job_name
+                self.output_data_config = configs.OutputDataConfig(
+                    s3_output_path=f"s3://{self._fetch_bucket_name_and_prefix(session)}"
+                    f"/{base_job_name}",
+                    compression_type="GZIP",
+                    kms_key_id=None,
+                )
+                logger.warning(
+                    f"OutputDataConfig not provided. Using default:\n{self.output_data_config}"
+                )
+            if self.output_data_config.s3_output_path is None:
+                session = self.sagemaker_session
+                base_job_name = self.base_job_name
+                self.output_data_config.s3_output_path = (
+                    f"s3://{self._fetch_bucket_name_and_prefix(session)}/{base_job_name}"
+                )
+                logger.warning(
+                    f"OutputDataConfig s3_output_path not provided. Using default:\n"
+                    f"{self.output_data_config.s3_output_path}"
+                )
+            if self.output_data_config.compression_type is None:
+                self.output_data_config.compression_type = "GZIP"
+                logger.warning(
+                    f"OutputDataConfig compression type not provided. Using default:\n"
+                    f"{self.output_data_config.compression_type}"
+                )
+
         if self.training_image:
             logger.info(f"Training image URI: {self.training_image}")
 
-    def _fetch_bucket_name_and_prefix(self, session: Session) -> str:
+    @staticmethod
+    def _fetch_bucket_name_and_prefix(session: Session) -> str:
         """Helper function to get the bucket name with the corresponding prefix if applicable"""
         if session.default_bucket_prefix is not None:
             return f"{session.default_bucket()}/{session.default_bucket_prefix}"
         return session.default_bucket()
 
-    @_telemetry_emitter(feature=Feature.MODEL_TRAINER, func_name="model_trainer.train")
-    @validate_call
-    def train(
+    def _create_training_job_args(
         self,
         input_data_config: Optional[List[Union[Channel, InputData]]] = None,
-        wait: Optional[bool] = True,
-        logs: Optional[bool] = True,
-    ):
-        """Train a model using AWS SageMaker.
+        boto3: bool = False,
+    ) -> Dict[str, Any]:
+        """Create the training job arguments.
 
         Args:
-            input_data_config (Optional[Union[List[Channel], Dict[str, DataSourceType]]]):
+            input_data_config (Optional[List[Union[Channel, InputData]]]):
+            input_data_config (Optional[List[Union[Channel, InputData]]]):
                 The input data config for the training job.
                 Takes a list of Channel objects or a dictionary of channel names to DataSourceType.
                 DataSourceType can be an S3 URI string, local file path string,
                 S3DataSource object, or FileSystemDataSource object.
-            wait (Optional[bool]):
-                Whether to wait for the training job to complete before returning.
-                Defaults to True.
-            logs (Optional[bool]):
-                Whether to display the training container logs while training.
-                Defaults to True.
+            boto3 (bool): Whether to return the arguments in boto3 format. Defaults to False.
+                By default, the arguments are returned in the format used by the SageMaker Core.
+
+        Returns:
+            Dict[str, Any]: The training job arguments.
         """
         self._populate_intelligent_defaults()
         current_training_job_name = _get_unique_name(self.base_job_name)
         input_data_key_prefix = f"{self.base_job_name}/{current_training_job_name}/input"
-        if input_data_config:
-            self.input_data_config = input_data_config
 
-        input_data_config = []
-        if self.input_data_config:
-            input_data_config = self._get_input_data_config(
-                self.input_data_config, input_data_key_prefix
+        final_input_data_config = self.input_data_config.copy() if self.input_data_config else []
+
+        if input_data_config:
+            # merge the inputs with method parameter taking precedence
+            existing_channels = {input.channel_name: input for input in final_input_data_config}
+            new_channels = []
+            for new_input in input_data_config:
+                if new_input.channel_name in existing_channels:
+                    existing_channels[new_input.channel_name] = new_input
+                else:
+                    new_channels.append(new_input)
+
+            final_input_data_config = list(existing_channels.values()) + new_channels
+
+        if self._is_nova_recipe:
+            for input_data in final_input_data_config:
+                if input_data.channel_name == SM_RECIPE:
+                    raise ValueError(
+                        "Cannot use reserved channel name 'recipe' as an input channel name "
+                        " for Nova Recipe"
+                    )
+            recipe_file_path = os.path.join(self._temp_recipe_train_dir.name, SM_RECIPE_YAML)
+            recipe_channel = self.create_input_data_channel(
+                channel_name=SM_RECIPE,
+                data_source=recipe_file_path,
+                key_prefix=input_data_key_prefix,
+            )
+            final_input_data_config.append(recipe_channel)
+            self.hyperparameters.update({"sagemaker_recipe_local_path": SM_RECIPE_CONTAINER_PATH})
+
+        if final_input_data_config:
+            final_input_data_config = self._get_input_data_config(
+                final_input_data_config, input_data_key_prefix
+            )
+
+        if self.checkpoint_config and not self.checkpoint_config.s3_uri:
+            self.checkpoint_config.s3_uri = (
+                f"s3://{self._fetch_bucket_name_and_prefix(self.sagemaker_session)}/"
+                f"{self.base_job_name}/{current_training_job_name}/checkpoints"
+            )
+        if self._tensorboard_output_config and not self._tensorboard_output_config.s3_output_path:
+            self._tensorboard_output_config.s3_output_path = (
+                f"s3://{self._fetch_bucket_name_and_prefix(self.sagemaker_session)}/"
+                f"{self.base_job_name}"
             )
 
         string_hyper_parameters = {}
@@ -577,16 +673,18 @@ class ModelTrainer(BaseModel):
         container_arguments = None
         if self.source_code:
             if self.training_mode == Mode.LOCAL_CONTAINER:
-                tmp_dir = TemporaryDirectory(prefix=os.path.join(self.local_container_root + "/"))
+                self._temp_code_dir = TemporaryDirectory(
+                    prefix=os.path.join(self.local_container_root + "/")
+                )
             else:
-                tmp_dir = TemporaryDirectory()
+                self._temp_code_dir = TemporaryDirectory()
             # Copy everything under container_drivers/ to a temporary directory
-            shutil.copytree(SM_DRIVERS_LOCAL_PATH, tmp_dir.name, dirs_exist_ok=True)
+            shutil.copytree(SM_DRIVERS_LOCAL_PATH, self._temp_code_dir.name, dirs_exist_ok=True)
 
             # If distributed is provided, overwrite code under <root>/drivers
             if self.distributed:
                 distributed_driver_dir = self.distributed.driver_dir
-                driver_dir = os.path.join(tmp_dir.name, "distributed_drivers")
+                driver_dir = os.path.join(self._temp_code_dir.name, "distributed_drivers")
                 shutil.copytree(distributed_driver_dir, driver_dir, dirs_exist_ok=True)
 
             # If source code is provided, create a channel for the source code
@@ -596,11 +694,12 @@ class ModelTrainer(BaseModel):
                     channel_name=SM_CODE,
                     data_source=self.source_code.source_dir,
                     key_prefix=input_data_key_prefix,
+                    ignore_patterns=self.source_code.ignore_patterns,
                 )
-                input_data_config.append(source_code_channel)
+                final_input_data_config.append(source_code_channel)
 
             self._prepare_train_script(
-                tmp_dir=tmp_dir,
+                tmp_dir=self._temp_code_dir,
                 source_code=self.source_code,
                 distributed=self.distributed,
             )
@@ -609,16 +708,17 @@ class ModelTrainer(BaseModel):
                 mp_parameters = self.distributed.smp._to_mp_hyperparameters()
                 string_hyper_parameters.update(mp_parameters)
 
-            self._write_source_code_json(tmp_dir=tmp_dir, source_code=self.source_code)
-            self._write_distributed_json(tmp_dir=tmp_dir, distributed=self.distributed)
+            self._write_source_code_json(tmp_dir=self._temp_code_dir, source_code=self.source_code)
+            self._write_distributed_json(tmp_dir=self._temp_code_dir, distributed=self.distributed)
 
             # Create an input channel for drivers packaged by the sdk
             sm_drivers_channel = self.create_input_data_channel(
                 channel_name=SM_DRIVERS,
-                data_source=tmp_dir.name,
+                data_source=self._temp_code_dir.name,
                 key_prefix=input_data_key_prefix,
+                ignore_patterns=self.source_code.ignore_patterns,
             )
-            input_data_config.append(sm_drivers_channel)
+            final_input_data_config.append(sm_drivers_channel)
 
             # If source_code is provided, we will always use
             # the default container entrypoint and arguments
@@ -635,45 +735,99 @@ class ModelTrainer(BaseModel):
             training_image_config=self.training_image_config,
             container_entrypoint=container_entrypoint,
             container_arguments=container_arguments,
+            metric_definitions=self._metric_definitions,
         )
 
         resource_config = self.compute._to_resource_config()
         vpc_config = self.networking._to_vpc_config() if self.networking else None
 
-        if self.training_mode == Mode.SAGEMAKER_TRAINING_JOB:
-            training_job = TrainingJob.create(
-                training_job_name=current_training_job_name,
-                algorithm_specification=algorithm_specification,
-                hyper_parameters=string_hyper_parameters,
-                input_data_config=input_data_config,
-                resource_config=resource_config,
-                vpc_config=vpc_config,
-                # Public Instance Attributes
-                session=self.sagemaker_session.boto_session,
-                role_arn=self.role,
-                tags=self.tags,
-                stopping_condition=self.stopping_condition,
-                output_data_config=self.output_data_config,
-                checkpoint_config=self.checkpoint_config,
-                environment=self.environment,
-                enable_managed_spot_training=self.compute.enable_managed_spot_training,
-                enable_inter_container_traffic_encryption=(
-                    self.networking.enable_inter_container_traffic_encryption
-                    if self.networking
-                    else None
-                ),
-                enable_network_isolation=(
-                    self.networking.enable_network_isolation if self.networking else None
-                ),
-                # Private Instance Attributes
-                remote_debug_config=self._remote_debug_config,
-                tensor_board_output_config=self._tensorboard_output_config,
-                retry_strategy=self._retry_strategy,
-                infra_check_config=self._infra_check_config,
-                session_chaining_config=self._session_chaining_config,
+        if boto3:
+            args = {}
+            args["TrainingJobName"] = current_training_job_name
+            args["AlgorithmSpecification"] = algorithm_specification
+            args["HyperParameters"] = string_hyper_parameters
+            args["InputDataConfig"] = final_input_data_config
+            args["ResourceConfig"] = resource_config
+            args["VpcConfig"] = vpc_config
+            args["RoleArn"] = self.role
+            args["Tags"] = self.tags
+            args["StoppingCondition"] = self.stopping_condition
+            args["OutputDataConfig"] = self.output_data_config
+            args["CheckpointConfig"] = self.checkpoint_config
+            args["Environment"] = self.environment
+            args["EnableManagedSotTraining"] = self.compute.enable_managed_spot_training
+            args["EnableInterContainerTrafficEncryption"] = (
+                self.networking.enable_inter_container_traffic_encryption
+                if self.networking
+                else None
             )
-            self._latest_training_job = training_job
+            args["EnableNetworkIsolation"] = (
+                self.networking.enable_network_isolation if self.networking else None
+            )
+            args["RemoteDebugConfig"] = self._remote_debug_config
+            args["TensorBoardOutputConfig"] = self._tensorboard_output_config
+            args["RetryStrategy"] = self._retry_strategy
+            args["InfraCheckConfig"] = self._infra_check_config
+            args["SessionChainingConfig"] = self._session_chaining_config
+            return serialize(args)
+        else:
+            args = {}
+            args["training_job_name"] = current_training_job_name
+            args["algorithm_specification"] = algorithm_specification
+            args["hyper_parameters"] = string_hyper_parameters
+            args["input_data_config"] = final_input_data_config
+            args["resource_config"] = resource_config
+            args["vpc_config"] = vpc_config
+            args["session"] = self.sagemaker_session.boto_session
+            args["role_arn"] = self.role
+            args["tags"] = self.tags
+            args["stopping_condition"] = self.stopping_condition
+            args["output_data_config"] = self.output_data_config
+            args["checkpoint_config"] = self.checkpoint_config
+            args["environment"] = self.environment
+            args["enable_managed_spot_training"] = self.compute.enable_managed_spot_training
+            args["enable_inter_container_traffic_encryption"] = (
+                self.networking.enable_inter_container_traffic_encryption
+                if self.networking
+                else None
+            )
+            args["enable_network_isolation"] = (
+                self.networking.enable_network_isolation if self.networking else None
+            )
+            args["remote_debug_config"] = self._remote_debug_config
+            args["tensor_board_output_config"] = self._tensorboard_output_config
+            args["retry_strategy"] = self._retry_strategy
+            args["infra_check_config"] = self._infra_check_config
+            args["session_chaining_config"] = self._session_chaining_config
+            return args
 
+    @_telemetry_emitter(feature=Feature.MODEL_TRAINER, func_name="model_trainer.train")
+    @validate_call
+    def train(
+        self,
+        input_data_config: Optional[List[Union[Channel, InputData]]] = None,
+        wait: Optional[bool] = True,
+        logs: Optional[bool] = True,
+    ):
+        """Train a model using AWS SageMaker.
+
+        Args:
+            input_data_config (Optional[List[Union[Channel, InputData]]]):
+                The input data config for the training job.
+                Takes a list of Channel objects or a dictionary of channel names to DataSourceType.
+                DataSourceType can be an S3 URI string, local file path string,
+                S3DataSource object, or FileSystemDataSource object.
+            wait (Optional[bool]):
+                Whether to wait for the training job to complete before returning.
+                Defaults to True.
+            logs (Optional[bool]):
+                Whether to display the training container logs while training.
+                Defaults to True.
+        """
+        args = self._create_training_job_args(input_data_config=input_data_config)
+        if self.training_mode == Mode.SAGEMAKER_TRAINING_JOB:
+            training_job = TrainingJob.create(**args)
+            self._latest_training_job = training_job
             if wait:
                 training_job.wait(logs=logs)
             if logs and not wait:
@@ -682,22 +836,28 @@ class ModelTrainer(BaseModel):
                 )
         else:
             local_container = _LocalContainer(
-                training_job_name=_get_unique_name(self.base_job_name),
-                instance_type=resource_config.instance_type,
-                instance_count=resource_config.instance_count,
-                image=algorithm_specification.training_image,
+                training_job_name=args["training_job_name"],
+                instance_type=args["resource_config"].instance_type,
+                instance_count=args["resource_config"].instance_count,
+                image=args["algorithm_specification"].training_image,
                 container_root=self.local_container_root,
                 sagemaker_session=self.sagemaker_session,
-                container_entrypoint=algorithm_specification.container_entrypoint,
-                container_arguments=algorithm_specification.container_arguments,
-                input_data_config=input_data_config,
-                hyper_parameters=string_hyper_parameters,
-                environment=self.environment,
+                container_entrypoint=args["algorithm_specification"].container_entrypoint,
+                container_arguments=args["algorithm_specification"].container_arguments,
+                input_data_config=args["input_data_config"],
+                hyper_parameters=args["hyper_parameters"],
+                environment=args["environment"],
             )
             local_container.train(wait)
+        if self._temp_code_dir is not None:
+            self._temp_code_dir.cleanup()
 
     def create_input_data_channel(
-        self, channel_name: str, data_source: DataSourceType, key_prefix: Optional[str] = None
+        self,
+        channel_name: str,
+        data_source: DataSourceType,
+        key_prefix: Optional[str] = None,
+        ignore_patterns: Optional[List[str]] = None,
     ) -> Channel:
         """Create an input data channel for the training job.
 
@@ -713,6 +873,10 @@ class ModelTrainer(BaseModel):
 
                 If specified, local data will be uploaded to:
                 ``s3://<default_bucket_path>/<key_prefix>/<channel_name>/``
+            ignore_patterns: (Optional[List[str]]) :
+                The ignore patterns to ignore specific files/folders when uploading to S3.
+                If not specified, default to: ['.env', '.git', '__pycache__', '.DS_Store',
+                '.cache', '.ipynb_checkpoints'].
         """
         channel = None
         if isinstance(data_source, str):
@@ -752,11 +916,28 @@ class ModelTrainer(BaseModel):
                     )
                     if self.sagemaker_session.default_bucket_prefix:
                         key_prefix = f"{self.sagemaker_session.default_bucket_prefix}/{key_prefix}"
-                    s3_uri = self.sagemaker_session.upload_data(
-                        path=data_source,
-                        bucket=self.sagemaker_session.default_bucket(),
-                        key_prefix=key_prefix,
-                    )
+                    if ignore_patterns and _is_valid_path(data_source, path_type="Directory"):
+                        tmp_dir = TemporaryDirectory()
+                        copied_path = os.path.join(
+                            tmp_dir.name, os.path.basename(os.path.normpath(data_source))
+                        )
+                        shutil.copytree(
+                            data_source,
+                            copied_path,
+                            dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns(*ignore_patterns),
+                        )
+                        s3_uri = self.sagemaker_session.upload_data(
+                            path=copied_path,
+                            bucket=self.sagemaker_session.default_bucket(),
+                            key_prefix=key_prefix,
+                        )
+                    else:
+                        s3_uri = self.sagemaker_session.upload_data(
+                            path=data_source,
+                            bucket=self.sagemaker_session.default_bucket(),
+                            key_prefix=key_prefix,
+                        )
                     channel = Channel(
                         channel_name=channel_name,
                         data_source=DataSource(
@@ -803,7 +984,9 @@ class ModelTrainer(BaseModel):
                 channels.append(input_data)
             elif isinstance(input_data, InputData):
                 channel = self.create_input_data_channel(
-                    input_data.channel_name, input_data.data_source, key_prefix=key_prefix
+                    input_data.channel_name,
+                    input_data.data_source,
+                    key_prefix=key_prefix,
                 )
                 channels.append(channel)
             else:
@@ -909,22 +1092,56 @@ class ModelTrainer(BaseModel):
         requirements: Optional[str] = None,
         training_image: Optional[str] = None,
         training_image_config: Optional[TrainingImageConfig] = None,
-        output_data_config: Optional[OutputDataConfig] = None,
+        output_data_config: Optional[shapes.OutputDataConfig] = None,
         input_data_config: Optional[List[Union[Channel, InputData]]] = None,
-        checkpoint_config: Optional[CheckpointConfig] = None,
+        checkpoint_config: Optional[shapes.CheckpointConfig] = None,
         training_input_mode: Optional[str] = "File",
         environment: Optional[Dict[str, str]] = None,
+        hyperparameters: Optional[Union[Dict[str, Any], str]] = {},
         tags: Optional[List[Tag]] = None,
         sagemaker_session: Optional[Session] = None,
         role: Optional[str] = None,
         base_job_name: Optional[str] = None,
-    ) -> "ModelTrainer":
+    ) -> "ModelTrainer":  # noqa: D412
         """Create a ModelTrainer from a training recipe.
+
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+            from sagemaker.modules.configs import Compute
+
+            recipe_overrides = {
+                "run": {
+                    "results_dir": "/opt/ml/model",
+                },
+                "model": {
+                    "data": {
+                        "use_synthetic_data": True
+                    }
+                }
+            }
+
+            compute = Compute(
+                instance_type="ml.p5.48xlarge",
+                keep_alive_period_in_seconds=3600
+            )
+
+            model_trainer = ModelTrainer.from_recipe(
+                training_recipe="fine-tuning/deepseek/hf_deepseek_r1_distilled_llama_8b_seq8k_gpu_fine_tuning",
+                recipe_overrides=recipe_overrides,
+                compute=compute,
+            )
+
+            model_trainer.train(wait=False)
+
 
         Args:
             training_recipe (str):
                 The training recipe to use for training the model. This must be the name of
                 a sagemaker training recipe or a path to a local training recipe .yaml file.
+                For available training recipes, see: https://github.com/aws/sagemaker-hyperpod-recipes/
             compute (Compute):
                 The compute configuration. This is used to specify the compute resources for
                 the training job. If not specified, will default to 1 instance of ml.m5.xlarge.
@@ -977,14 +1194,21 @@ class ModelTrainer(BaseModel):
         """
         if compute.instance_type is None:
             raise ValueError(
-                "Must set ``instance_type`` in compute_config when using training recipes."
+                "Must set ``instance_type`` in ``compute`` input when using training recipes."
             )
         device_type = _determine_device_type(compute.instance_type)
-        if device_type == "cpu":
+        recipe = _load_base_recipe(
+            training_recipe=training_recipe, recipe_overrides=recipe_overrides
+        )
+        is_nova = _is_nova_recipe(recipe=recipe)
+
+        if device_type == "cpu" and not is_nova:
             raise ValueError(
-                "Training recipes are not supported for CPU instances. "
+                "Training recipe is not supported for CPU instances. "
                 + "Please provide a GPU or Tranium instance type."
             )
+        if training_image is None and is_nova:
+            raise ValueError("training_image must be provided when using recipe for Nova.")
 
         if training_image_config and training_image is None:
             raise ValueError("training_image must be provided when using training_image_config.")
@@ -1002,15 +1226,27 @@ class ModelTrainer(BaseModel):
         # - distributed
         # - compute
         # - hyperparameters
-        model_trainer_args, recipe_train_dir = _get_args_from_recipe(
-            training_recipe=training_recipe,
+        model_trainer_args, tmp_dir = _get_args_from_recipe(
+            training_recipe=recipe,
             recipe_overrides=recipe_overrides,
             requirements=requirements,
             compute=compute,
             region_name=sagemaker_session.boto_region_name,
+            role=role,
         )
         if training_image is not None:
             model_trainer_args["training_image"] = training_image
+        if hyperparameters and not is_nova:
+            logger.warning(
+                "Hyperparameters are not supported for general training recipes. "
+                + "Ignoring hyperparameters input."
+            )
+        if is_nova:
+            if hyperparameters and isinstance(hyperparameters, str):
+                hyperparameters = cls._validate_and_load_hyperparameters_file(hyperparameters)
+                model_trainer_args["hyperparameters"].update(hyperparameters)
+            elif hyperparameters and isinstance(hyperparameters, dict):
+                model_trainer_args["hyperparameters"].update(hyperparameters)
 
         model_trainer = cls(
             sagemaker_session=sagemaker_session,
@@ -1027,60 +1263,175 @@ class ModelTrainer(BaseModel):
             tags=tags,
             **model_trainer_args,
         )
-
-        model_trainer._temp_recipe_train_dir = recipe_train_dir
+        model_trainer._is_nova_recipe = is_nova
+        model_trainer._temp_recipe_train_dir = tmp_dir
         return model_trainer
 
     def with_tensorboard_output_config(
-        self, tensorboard_output_config: TensorBoardOutputConfig
-    ) -> "ModelTrainer":
+        self, tensorboard_output_config: Optional[shapes.TensorBoardOutputConfig] = None
+    ) -> "ModelTrainer":  # noqa: D412
         """Set the TensorBoard output configuration.
+
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_tensorboard_output_config()
 
         Args:
             tensorboard_output_config (sagemaker.modules.configs.TensorBoardOutputConfig):
                 The TensorBoard output configuration.
         """
-        self._tensorboard_output_config = tensorboard_output_config
+        self._tensorboard_output_config = (
+            tensorboard_output_config or configs.TensorBoardOutputConfig()
+        )
         return self
 
-    def with_retry_strategy(self, retry_strategy: RetryStrategy) -> "ModelTrainer":
+    def with_retry_strategy(self, retry_strategy: RetryStrategy) -> "ModelTrainer":  # noqa: D412
         """Set the retry strategy for the training job.
 
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+            from sagemaker.modules.configs import RetryStrategy
+
+            retry_strategy = RetryStrategy(maximum_retry_attempts=3)
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_retry_strategy(retry_strategy)
+
         Args:
-            retry_strategy (RetryStrategy):
+            retry_strategy (sagemaker.modules.configs.RetryStrategy):
                 The retry strategy for the training job.
         """
         self._retry_strategy = retry_strategy
         return self
 
-    def with_infra_check_config(self, infra_check_config: InfraCheckConfig) -> "ModelTrainer":
+    def with_infra_check_config(
+        self, infra_check_config: Optional[InfraCheckConfig] = None
+    ) -> "ModelTrainer":  # noqa: D412
         """Set the infra check configuration for the training job.
 
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_infra_check_config()
+
         Args:
-            infra_check_config (InfraCheckConfig):
+            infra_check_config (sagemaker.modules.configs.InfraCheckConfig):
                 The infra check configuration for the training job.
         """
-        self._infra_check_config = infra_check_config
+        self._infra_check_config = infra_check_config or InfraCheckConfig(enable_infra_check=True)
         return self
 
     def with_session_chaining_config(
-        self, session_chaining_config: SessionChainingConfig
-    ) -> "ModelTrainer":
+        self, session_chaining_config: Optional[SessionChainingConfig] = None
+    ) -> "ModelTrainer":  # noqa: D412
         """Set the session chaining configuration for the training job.
 
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_session_chaining_config()
+
         Args:
-            session_chaining_config (SessionChainingConfig):
+            session_chaining_config (sagemaker.modules.configs.SessionChainingConfig):
                 The session chaining configuration for the training job.
         """
-        self._session_chaining_config = session_chaining_config
+        self._session_chaining_config = session_chaining_config or SessionChainingConfig(
+            enable_session_tag_chaining=True
+        )
         return self
 
-    def with_remote_debug_config(self, remote_debug_config: RemoteDebugConfig) -> "ModelTrainer":
+    def with_remote_debug_config(
+        self, remote_debug_config: Optional[RemoteDebugConfig] = None
+    ) -> "ModelTrainer":  # noqa: D412
         """Set the remote debug configuration for the training job.
 
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_remote_debug_config()
+
         Args:
-            remote_debug_config (RemoteDebugConfig):
+            remote_debug_config (sagemaker.modules.configs.RemoteDebugConfig):
                 The remote debug configuration for the training job.
         """
-        self._remote_debug_config = remote_debug_config
+        self._remote_debug_config = remote_debug_config or RemoteDebugConfig(
+            enable_remote_debug=True
+        )
+        return self
+
+    def with_checkpoint_config(
+        self, checkpoint_config: Optional[shapes.CheckpointConfig] = None
+    ) -> "ModelTrainer":  # noqa: D412
+        """Set the checkpoint configuration for the training job.
+
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_checkpoint_config()
+
+        Args:
+            checkpoint_config (sagemaker.modules.configs.CheckpointConfig):
+                The checkpoint configuration for the training job.
+        """
+        self.checkpoint_config = checkpoint_config or configs.CheckpointConfig()
+        return self
+
+    def with_metric_definitions(
+        self, metric_definitions: List[MetricDefinition]
+    ) -> "ModelTrainer":  # noqa: D412
+        """Set the metric definitions for the training job.
+
+        Example:
+
+        .. code:: python
+
+            from sagemaker.modules.train import ModelTrainer
+            from sagemaker.modules.configs import MetricDefinition
+
+            metric_definitions = [
+                MetricDefinition(
+                    name="loss",
+                    regex="Loss: (.*?)",
+                )
+            ]
+
+            model_trainer = ModelTrainer(
+                ...
+            ).with_metric_definitions(metric_definitions)
+
+        Args:
+            metric_definitions (List[MetricDefinition]):
+                The metric definitions for the training job.
+        """
+        self._metric_definitions = metric_definitions
         return self

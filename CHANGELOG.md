@@ -1,5 +1,131 @@
 # Changelog
 
+## v2.249.0 (2025-07-31)
+
+### Features
+
+ * AWS Batch for SageMaker Training jobs
+
+### Bug Fixes and Other Changes
+
+ * Directly use customer-provided endpoint name for ModelBuilder deployment.
+ * update image_uri_configs 07-23-2025 07:18:25 PST
+
+## v2.248.2 (2025-07-22)
+
+### Bug Fixes and Other Changes
+
+ * Relax boto3 version requirement
+ * update image_uri_configs 07-22-2025 07:18:25 PST
+ * update image_uri_configs 07-18-2025 07:18:28 PST
+ * add hard dependency on sagemaker-core pypi lib
+ * When rootlessDocker is enabled, return a fixed SageMaker IP
+
+## v2.248.1 (2025-07-16)
+
+### Bug Fixes and Other Changes
+
+ * Nova training support
+
+## v2.248.0 (2025-07-15)
+
+### Features
+
+ * integrate amtviz for visualization of tuning jobs
+
+### Bug Fixes and Other Changes
+
+ * build(deps): bump requests in /tests/data/serve_resources/mlflow/pytorch
+ * build(deps): bump protobuf from 4.25.5 to 4.25.8 in /requirements/extras
+ * build(deps): bump mlflow in /tests/data/serve_resources/mlflow/xgboost
+ * build(deps): bump torch in /tests/data/modules/script_mode
+ * sanitize git clone repo input url
+ * Adding Hyperpod feature to enable hyperpod telemetry
+ * Adding Hyperpod feature to enable hyperpod telemetry
+ * Bump SMD version to enable custom workflow deployment.
+ * Update TF DLC python version to py312
+ * update image_uri_configs 07-04-2025 07:18:27 PST
+ * update image_uri_configs 06-26-2025 07:18:35 PST
+ * relax protobuf to <6.32
+
+## v2.247.1 (2025-06-23)
+
+### Bug Fixes and Other Changes
+
+ * update image_uri_configs 06-19-2025 07:18:34 PST
+
+## v2.247.0 (2025-06-13)
+
+### Features
+
+ * Add support for MetricDefinitions in ModelTrainer
+
+### Bug Fixes and Other Changes
+
+ * update jumpstart region_config, update image_uri_configs 06-12-2025 07:18:12 PST
+ * Add ignore_patterns in ModelTrainer to ignore specific files/folders
+ * Allow import failure for internal _hashlib module
+
+## v2.246.0 (2025-06-04)
+
+### Features
+
+ * Triton v25.04 DLC
+
+### Bug Fixes and Other Changes
+
+ * Update Attrs version to widen support
+ * update estimator documentation regarding hyperparameters for source_dir
+
+## v2.245.0 (2025-05-28)
+
+### Features
+
+ * Correct mypy type checking through PEP 561
+
+### Bug Fixes and Other Changes
+
+ * MLFLow update for dependabot
+ * addWaiterTimeoutHandling
+ * merge method inputs with class inputs
+ * update image_uri_configs 05-20-2025 07:18:17 PST
+
+## v2.244.2 (2025-05-19)
+
+### Bug Fixes and Other Changes
+
+ * include model channel for gated uncompressed models
+ * clarify model monitor one time schedule bug
+ * update jumpstart region_config 05-15-2025 07:18:15 PST
+ * update image_uri_configs 05-14-2025 07:18:16 PST
+ * Add image configs and region config for TPE (ap-east-2)
+ * Improve defaults handling in ModelTrainer
+
+## v2.244.1 (2025-05-15)
+
+### Bug Fixes and Other Changes
+
+ * Fix Flask-Limiter version
+ * Fix test_huggingface_tei_uris()
+ * huggingface-llm-neuronx dlc
+ * huggingface-neuronx dlc image_uri
+ * huggingface-tei dlc image_uri
+ * Fix test_deploy_with_update_endpoint()
+ * add AG v1.3
+ * parameter mismatch in update_endpoint
+ * remove --strip-component for untar source tar.gz
+ * Fix type annotations
+ * chore: Allow omegaconf >=2.2,<3
+ * honor json serialization of HPs
+ * Map llama models to correct script
+ * pin test dependency
+ * fix bad initialization script error message
+ * Improve error logging and documentation for issue 4007
+ * build(deps): bump scikit-learn
+ * build(deps): bump mlflow
+ * build(deps): bump mlflow in /tests/data/serve_resources/mlflow/pytorch
+ * chore: Add tei 1.6.0 image
+
 ## v2.244.0 (2025-05-02)
 
 ### Features
